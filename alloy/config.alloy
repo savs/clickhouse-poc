@@ -1,0 +1,81 @@
+// OTLP receiver — accepts metrics, logs, and traces over gRPC and HTTP
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+    logs    = [otelcol.processor.batch.default.input]
+    traces  = [otelcol.processor.batch.default.input]
+  }
+}
+
+// Scrape Alloy's own Prometheus metrics and ClickHouse's metrics
+prometheus.scrape "self" {
+  targets = [
+    { __address__ = "localhost:12345",  service = "alloy" },
+    { __address__ = "clickhouse:8123",  service = "clickhouse" },
+  ]
+  forward_to = [otelcol.receiver.prometheus.self.receiver]
+}
+
+// Convert scraped Prometheus metrics to OTLP and feed into the pipeline
+otelcol.receiver.prometheus "self" {
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+
+// Discover all Docker containers
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// Filter to just the grafana container
+discovery.relabel "grafana_logs" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/grafana"
+    action        = "keep"
+  }
+}
+
+// Tail grafana container logs from Docker
+loki.source.docker "grafana" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.grafana_logs.output
+  forward_to = [otelcol.receiver.loki.default.receiver]
+}
+
+// Convert Loki-format logs to OTLP
+otelcol.receiver.loki "default" {
+  output {
+    logs = [otelcol.processor.batch.default.input]
+  }
+}
+
+// Batch processor — buffers data before export
+otelcol.processor.batch "default" {
+  output {
+    metrics = [otelcol.exporter.otlphttp.otelcol.input]
+    logs    = [otelcol.exporter.otlphttp.otelcol.input]
+    traces  = [otelcol.exporter.otlphttp.otelcol.input]
+  }
+}
+
+// Forward everything to OTel Collector Contrib → ClickHouse
+otelcol.exporter.otlphttp "otelcol" {
+  client {
+    endpoint = "http://otelcol:4318"
+    tls {
+      insecure = true
+    }
+  }
+}

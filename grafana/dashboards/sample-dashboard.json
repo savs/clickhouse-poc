@@ -1,0 +1,104 @@
+{
+  "title": "ClickHouse Observability Dashboard",
+  "tags": ["clickhouse", "alloy", "observability"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "uid": "clickhouse-observability",
+  "panels": [
+    {
+      "id": 1,
+      "title": "CPU Metrics Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "queryType": "sql",
+          "rawSql": "SELECT TimeUnix AS timestamp, MetricName AS metric_name, Value AS value\nFROM otel_metrics_gauge\nWHERE MetricName LIKE '%cpu%'\n  AND $__timeFilter(TimeUnix)\nUNION ALL\nSELECT TimeUnix AS timestamp, MetricName AS metric_name, Value AS value\nFROM otel_metrics_sum\nWHERE MetricName LIKE '%cpu%'\n  AND $__timeFilter(TimeUnix)\nORDER BY timestamp ASC",
+          "format": 0,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Memory Metrics Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "queryType": "sql",
+          "rawSql": "SELECT TimeUnix AS timestamp, MetricName AS metric_name, Value AS value\nFROM otel_metrics_gauge\nWHERE MetricName LIKE '%mem%'\n  AND $__timeFilter(TimeUnix)\nUNION ALL\nSELECT TimeUnix AS timestamp, MetricName AS metric_name, Value AS value\nFROM otel_metrics_sum\nWHERE MetricName LIKE '%mem%'\n  AND $__timeFilter(TimeUnix)\nORDER BY timestamp ASC",
+          "format": 0,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Recent Logs",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "queryType": "sql",
+          "rawSql": "SELECT\n  Timestamp AS timestamp,\n  SeverityText AS level,\n  Body AS message,\n  ServiceName AS service\nFROM otel_logs\nWHERE $__timeFilter(Timestamp)\nORDER BY Timestamp DESC\nLIMIT 100",
+          "format": 2,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Trace Latency Distribution",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "queryType": "sql",
+          "rawSql": "SELECT Duration / 1000000 AS latency_ms\nFROM otel_traces\nWHERE $__timeFilter(Timestamp)",
+          "format": 1,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Traces by Service",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "queryType": "sql",
+          "rawSql": "SELECT ServiceName AS service_name, count() AS count\nFROM otel_traces\nWHERE $__timeFilter(Timestamp)\nGROUP BY service_name",
+          "format": 1,
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" }
+}

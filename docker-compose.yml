@@ -1,0 +1,109 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: grafana
+      CLICKHOUSE_PASSWORD: grafana
+    networks:
+      - grafana-net
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otelcol
+    volumes:
+      - ./otelcol/config.yaml:/etc/otelcol-contrib/config.yaml
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks:
+      - grafana-net
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  alloy:
+    image: grafana/alloy:latest
+    container_name: grafana-alloy
+    ports:
+      - "12345:12345"
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy
+      - alloy-data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    networks:
+      - grafana-net
+    depends_on:
+      - otelcol
+
+  pdc:
+    image: grafana/pdc-agent:latest
+    container_name: grafana-pdc
+    env_file:
+      - .env
+    command:
+      - -token
+      - ${GCLOUD_PDC_SIGNING_TOKEN}
+      - -cluster
+      - ${GCLOUD_PDC_CLUSTER}
+      - -gcloud-hosted-grafana-id
+      - ${GCLOUD_HOSTED_GRAFANA_ID}
+    networks:
+      - grafana-net
+    depends_on:
+      - clickhouse
+
+  grafana:
+    build: ./grafana
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_FEATURE_TOGGLES_ENABLE: publicDashboards
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      GF_TRACING_OPENTELEMETRY_OTLP_ADDRESS: alloy:4317
+      GF_TRACING_OPENTELEMETRY_OTLP_PROPAGATION: w3c
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - grafana-net
+    depends_on:
+      - clickhouse
+      - pdc
+      - alloy
+
+networks:
+  grafana-net:
+    driver: bridge
+
+volumes:
+  clickhouse-data:
+  grafana-data:
+  alloy-data:
