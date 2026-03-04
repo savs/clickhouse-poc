@@ -36,21 +36,21 @@ discovery.docker "containers" {
   host = "unix:///var/run/docker.sock"
 }
 
-// Filter to just the grafana container
-discovery.relabel "grafana_logs" {
+// Filter to application containers
+discovery.relabel "app_logs" {
   targets = discovery.docker.containers.targets
 
   rule {
     source_labels = ["__meta_docker_container_name"]
-    regex         = "/grafana"
+    regex         = "/(grafana|hotel-service|flight-service|booking-service|frontend)"
     action        = "keep"
   }
 }
 
-// Tail grafana container logs from Docker
-loki.source.docker "grafana" {
+// Tail application container logs from Docker
+loki.source.docker "apps" {
   host       = "unix:///var/run/docker.sock"
-  targets    = discovery.relabel.grafana_logs.output
+  targets    = discovery.relabel.app_logs.output
   forward_to = [otelcol.receiver.loki.default.receiver]
 }
 

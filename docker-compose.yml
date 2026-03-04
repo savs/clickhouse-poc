@@ -99,6 +99,55 @@ services:
       - pdc
       - alloy
 
+  hotel-service:
+    build: ./hotel-service
+    container_name: hotel-service
+    environment:
+      OTEL_SERVICE_NAME: hotel-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+    networks:
+      - grafana-net
+    depends_on:
+      - alloy
+
+  flight-service:
+    build: ./flight-service
+    container_name: flight-service
+    environment:
+      OTEL_SERVICE_NAME: flight-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+    networks:
+      - grafana-net
+    depends_on:
+      - alloy
+
+  booking-service:
+    build: ./booking-service
+    container_name: booking-service
+    ports:
+      - "4000:4000"
+    environment:
+      OTEL_SERVICE_NAME: booking-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+      HOTEL_SERVICE_URL: http://hotel-service:3001
+      FLIGHT_SERVICE_URL: http://flight-service:3002
+    networks:
+      - grafana-net
+    depends_on:
+      - alloy
+      - hotel-service
+      - flight-service
+
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    ports:
+      - "8080:80"
+    networks:
+      - grafana-net
+    depends_on:
+      - booking-service
+
 networks:
   grafana-net:
     driver: bridge
