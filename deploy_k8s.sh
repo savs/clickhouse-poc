@@ -9,6 +9,7 @@ set -euo pipefail
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 CLEAN=false
+REBUILD=false
 PREFIX=""
 VERSION=""
 DOMAIN=""
@@ -16,6 +17,7 @@ AWS_PROFILE="grafana-dev"   # default; override with -profile
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -clean)         CLEAN=true; shift ;;
+    -rebuild)       REBUILD=true; shift ;;
     -prefix)        PREFIX="$2"; shift 2 ;;
     -version)       VERSION="$2"; shift 2 ;;
     -domain)        DOMAIN="$2"; shift 2 ;;
@@ -144,15 +146,52 @@ docker buildx use travel-app-builder
 # Images are tagged as <service>-<version>. If the tag already exists in ECR,
 # the build is skipped. Use -version to pin a tag; defaults to git commit hash.
 log "Building and pushing images (version: ${IMAGE_TAG})"
+
+# Detect uncommitted/unstaged local changes. Only matters when IMAGE_TAG is
+# derived from the git HEAD hash — if the user passed -version, they're
+# explicitly pinning a tag and may intentionally be reusing it.
+GIT_DIRTY=false
+GIT_CHANGED_FILES=""
+if [ -z "$VERSION" ] && ! git diff --quiet HEAD 2>/dev/null; then
+  GIT_DIRTY=true
+  GIT_CHANGED_FILES=$(git diff --name-only HEAD 2>/dev/null)
+fi
+STALE_WARNING_SHOWN=false
+
 for img in "${IMAGES[@]}"; do
   full_uri="${ECR_REGISTRY}/${ECR_REPO}:${img}-${IMAGE_TAG}"
-  if aws ecr describe-images \
+  if [ "$REBUILD" = false ] && aws ecr describe-images \
        --profile        "$AWS_PROFILE" \
        --region         "$AWS_REGION" \
        --repository-name "$ECR_REPO" \
        --image-ids      "imageTag=${img}-${IMAGE_TAG}" \
        &>/dev/null 2>&1; then
     ok "  Already in ECR, skipping build: ${full_uri}"
+    # Warn once if local changes exist that won't be in the deployed image.
+    # The tag matches the current git HEAD, but the working tree has drifted,
+    # so the image in ECR was built from an earlier state of the code.
+    if [ "$GIT_DIRTY" = true ] && [ "$STALE_WARNING_SHOWN" = false ]; then
+      STALE_WARNING_SHOWN=true
+      echo "" >&2
+      echo "⚠   STALE IMAGE WARNING" >&2
+      echo "    ECR already has images tagged '${IMAGE_TAG}' (current git HEAD)," >&2
+      echo "    but your working tree has uncommitted changes. The images that" >&2
+      echo "    will be deployed do NOT include these local modifications:" >&2
+      echo "" >&2
+      echo "$GIT_CHANGED_FILES" | while IFS= read -r f; do echo "      • $f" >&2; done
+      echo "" >&2
+      echo "    To deploy your local changes, commit them first:" >&2
+      echo "      git add -A && git commit -m 'your message'" >&2
+      echo "      ./deploy_k8s.sh [same flags]" >&2
+      echo "" >&2
+      echo "    Or force a rebuild under a new tag:" >&2
+      echo "      ./deploy_k8s.sh -version <new-tag> [same flags]" >&2
+      echo "" >&2
+      printf "    Continuing in 5 s… (Ctrl-C to abort)" >&2
+      for _i in 1 2 3 4 5; do sleep 1; printf " ." >&2; done
+      echo "" >&2
+      echo "" >&2
+    fi
     continue
   fi
   log "  Building ${img} → ${full_uri}"
@@ -565,6 +604,20 @@ kubectl --context "$KUBECTL_CONTEXT" create secret generic frontend-credentials 
   --dry-run=client -o yaml \
 | kubectl --context "$KUBECTL_CONTEXT" apply -f -
 ok "Frontend credentials secret applied"
+
+# ── K8s: pre-generate nginx htpasswd ─────────────────────────────────────────
+# openssl is not installed in nginx:alpine, so generating the hash inside the
+# container at startup silently fails and produces an empty password entry.
+# Pre-compute the APR1 hash here (where openssl is available) and store it as
+# a secret mounted directly at /etc/nginx/.htpasswd in all nginx containers.
+log "Creating nginx-htpasswd secret"
+HTPASSWD_ENTRY="${frontend_user}:$(openssl passwd -apr1 "${frontend_password}")"
+kubectl --context "$KUBECTL_CONTEXT" create secret generic nginx-htpasswd \
+  --namespace "$NAMESPACE" \
+  --from-literal=".htpasswd=${HTPASSWD_ENTRY}" \
+  --dry-run=client -o yaml \
+| kubectl --context "$KUBECTL_CONTEXT" apply -f -
+ok "nginx-htpasswd secret applied"
 
 # ── K8s: apply remaining manifests ───────────────────────────────────────────
 # Use explicit variable list so nginx-config ConfigMaps aren't broken by

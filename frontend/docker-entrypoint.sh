@@ -1,16 +1,6 @@
 #!/bin/sh
 set -e
 
-# ── Basic auth: write htpasswd file from env vars ────────────────────────────
-if [ -z "$FRONTEND_USER" ] || [ -z "$FRONTEND_PASSWORD" ]; then
-  echo "ERROR: FRONTEND_USER and FRONTEND_PASSWORD must be set" >&2
-  exit 1
-fi
-printf '%s:%s\n' \
-  "$FRONTEND_USER" \
-  "$(openssl passwd -apr1 "$FRONTEND_PASSWORD")" \
-  > /etc/nginx/.htpasswd
-
 # ── TLS cert: use real cert if available, otherwise generate a placeholder ────
 # nginx cannot start without a certificate. The cert-manager Secret may not
 # exist yet on first deploy (DNS-01 issuance takes 2-5 min). A temporary

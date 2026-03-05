@@ -19,20 +19,13 @@ spec:
           ports:
             - containerPort: 80
             - containerPort: 443
-          env:
-            - name: FRONTEND_USER
-              valueFrom:
-                secretKeyRef:
-                  name: frontend-credentials
-                  key: username
-            - name: FRONTEND_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: frontend-credentials
-                  key: password
           volumeMounts:
             - name: frontend-tls
               mountPath: /etc/nginx/ssl
+              readOnly: true
+            - name: nginx-htpasswd
+              mountPath: /etc/nginx/.htpasswd
+              subPath: .htpasswd
               readOnly: true
           resources:
             requests:
@@ -46,6 +39,9 @@ spec:
           secret:
             secretName: frontend-tls
             optional: true   # pod starts before cert-manager issues the cert
+        - name: nginx-htpasswd
+          secret:
+            secretName: nginx-htpasswd
 ---
 apiVersion: v1
 kind: Service

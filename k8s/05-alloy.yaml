@@ -60,8 +60,6 @@ spec:
             - /bin/sh
             - -c
             - |
-              printf '%s:%s\n' "$FRONTEND_USER" "$(openssl passwd -apr1 "$FRONTEND_PASSWORD")" \
-                > /etc/nginx/.htpasswd
               mkdir -p /etc/nginx/ssl-live
               if [ -f /etc/nginx/ssl/tls.crt ]; then
                 cp /etc/nginx/ssl/tls.crt /etc/nginx/ssl-live/tls.crt
@@ -80,17 +78,6 @@ spec:
                   fi
                 done ) &
               exec nginx -g 'daemon off;'
-          env:
-            - name: FRONTEND_USER
-              valueFrom:
-                secretKeyRef:
-                  name: frontend-credentials
-                  key: username
-            - name: FRONTEND_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: frontend-credentials
-                  key: password
           ports:
             - containerPort: 80
             - containerPort: 443
@@ -100,6 +87,10 @@ spec:
               readOnly: true
             - name: nginx-config
               mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: nginx-htpasswd
+              mountPath: /etc/nginx/.htpasswd
+              subPath: .htpasswd
               readOnly: true
           readinessProbe:
             tcpSocket:
@@ -128,6 +119,9 @@ spec:
         - name: nginx-config
           configMap:
             name: alloy-nginx-config
+        - name: nginx-htpasswd
+          secret:
+            secretName: nginx-htpasswd
 ---
 # Internal ClusterIP service — used by other pods to send OTLP telemetry.
 apiVersion: v1
