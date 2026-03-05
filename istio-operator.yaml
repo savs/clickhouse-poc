@@ -1,0 +1,12 @@
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  profile: demo
+  meshConfig:
+    # Disable default stdout access logging — all access logs go via OTel instead
+    accessLogFile: ""
+    extensionProviders:
+      - name: otel-access-log
+        opentelemetry:
+          port: 4317
+          service: otelcol.travel-app.svc.cluster.local

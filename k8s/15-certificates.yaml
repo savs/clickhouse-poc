@@ -1,0 +1,38 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: frontend-tls
+  namespace: travel-app
+spec:
+  secretName: frontend-tls
+  dnsNames:
+    - ${HOSTNAME_PREFIX}frontend.${DNS_DOMAIN}
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: grafana-tls
+  namespace: travel-app
+spec:
+  secretName: grafana-tls
+  dnsNames:
+    - ${HOSTNAME_PREFIX}grafana.${DNS_DOMAIN}
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: alloy-tls
+  namespace: travel-app
+spec:
+  secretName: alloy-tls
+  dnsNames:
+    - ${HOSTNAME_PREFIX}alloy.${DNS_DOMAIN}
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer

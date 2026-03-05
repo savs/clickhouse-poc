@@ -11,17 +11,20 @@ set -euo pipefail
 CLEAN=false
 PREFIX=""
 VERSION=""
+DOMAIN=""
+AWS_PROFILE="grafana-dev"   # default; override with -profile
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -clean)         CLEAN=true; shift ;;
     -prefix)        PREFIX="$2"; shift 2 ;;
     -version)       VERSION="$2"; shift 2 ;;
+    -domain)        DOMAIN="$2"; shift 2 ;;
+    -profile)       AWS_PROFILE="$2"; shift 2 ;;
     *) echo "✗  Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
 
 # ── Configuration ────────────────────────────────────────────────────────────
-AWS_PROFILE="grafana-dev"
 AWS_REGION="${AWS_REGION:-us-west-2}"
 # Prefix the cluster/repo name so AWS resources can be traced back to the owner.
 # Usage: ./deploy_k8s.sh -prefix alice
@@ -48,7 +51,7 @@ require() {
 }
 
 # ── Preflight ────────────────────────────────────────────────────────────────
-require aws eksctl kubectl docker envsubst
+require aws eksctl kubectl istioctl docker envsubst
 
 log "Verifying AWS credentials (profile: $AWS_PROFILE)"
 AWS_ACCOUNT=$(aws sts get-caller-identity \
@@ -59,6 +62,45 @@ ok "Account: $AWS_ACCOUNT"
 export ECR_REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 export ECR_REPO
 export IMAGE_TAG
+export CLUSTER_NAME
+export AWS_REGION
+export HOSTNAME_PREFIX="${PREFIX:+${PREFIX}-}"   # e.g. "alice-" or ""
+[ -z "$DOMAIN" ] && die "Missing required flag: -domain <your-domain.com>"
+export DNS_DOMAIN="$DOMAIN"
+
+# ── DNS: verify hosted zone exists in Route 53 ───────────────────────────────
+log "Verifying Route 53 hosted zone: $DNS_DOMAIN"
+HOSTED_ZONE_ID=$(aws route53 list-hosted-zones \
+  --profile "$AWS_PROFILE" \
+  --query   "HostedZones[?Name=='${DNS_DOMAIN}.'].Id" \
+  --output  text 2>/dev/null || true)
+
+if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" = "None" ]; then
+  echo ""
+  echo "✗  Route 53 hosted zone not found for '$DNS_DOMAIN'." >&2
+  echo "" >&2
+  echo "   To set it up:" >&2
+  echo "" >&2
+  echo "   1. Register or transfer the domain to Route 53:" >&2
+  echo "      https://console.aws.amazon.com/route53/home#DomainListing:" >&2
+  echo "" >&2
+  echo "   2. If the domain is registered elsewhere, create a public hosted zone:" >&2
+  echo "      aws route53 create-hosted-zone \\" >&2
+  echo "        --profile $AWS_PROFILE \\" >&2
+  echo "        --name $DNS_DOMAIN \\" >&2
+  echo "        --caller-reference \$(date +%s)" >&2
+  echo "" >&2
+  echo "   3. Copy the NS records from the hosted zone and add them as NS records" >&2
+  echo "      at your domain registrar so Route 53 becomes the authoritative DNS." >&2
+  echo "" >&2
+  echo "   4. Re-run this script once the hosted zone is in place." >&2
+  echo "" >&2
+  exit 1
+fi
+ok "Hosted zone found: $HOSTED_ZONE_ID"
+# cert-manager expects the zone ID without the /hostedzone/ prefix
+HOSTED_ZONE_ID_SHORT="${HOSTED_ZONE_ID#/hostedzone/}"
+export HOSTED_ZONE_ID_SHORT
 
 # ── ECR: create single repo if it doesn't exist ──────────────────────────────
 log "Ensuring ECR repository exists: $ECR_REPO"
@@ -154,6 +196,32 @@ if [ "$CLUSTER_EXISTS" = true ] && [ "$CLEAN" = true ]; then
     --disable-nodegroup-eviction
   ok "Cluster deleted"
   CLUSTER_EXISTS=false
+
+  # Delete cert-manager IAM policy
+  CERT_MANAGER_POLICY_ARN=$(aws iam list-policies \
+    --profile "$AWS_PROFILE" \
+    --query   "Policies[?PolicyName=='CertManager-${CLUSTER_NAME}'].Arn" \
+    --output  text 2>/dev/null || true)
+  if [ -n "$CERT_MANAGER_POLICY_ARN" ] && [ "$CERT_MANAGER_POLICY_ARN" != "None" ]; then
+    log "Deleting cert-manager IAM policy"
+    aws iam delete-policy \
+      --profile    "$AWS_PROFILE" \
+      --policy-arn "$CERT_MANAGER_POLICY_ARN"
+    ok "cert-manager IAM policy deleted"
+  fi
+
+  # Delete External-DNS IAM policy (not managed by eksctl, must be removed manually)
+  EXTERNAL_DNS_POLICY_ARN=$(aws iam list-policies \
+    --profile "$AWS_PROFILE" \
+    --query   "Policies[?PolicyName=='ExternalDNS-${CLUSTER_NAME}'].Arn" \
+    --output  text 2>/dev/null || true)
+  if [ -n "$EXTERNAL_DNS_POLICY_ARN" ] && [ "$EXTERNAL_DNS_POLICY_ARN" != "None" ]; then
+    log "Deleting External-DNS IAM policy"
+    aws iam delete-policy \
+      --profile    "$AWS_PROFILE" \
+      --policy-arn "$EXTERNAL_DNS_POLICY_ARN"
+    ok "External-DNS IAM policy deleted"
+  fi
 
   # Delete the ECR repository and all images inside it
   if aws ecr describe-repositories \
@@ -281,6 +349,39 @@ else
     --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
     --wait
   ok "EBS CSI driver ready"
+
+  # ── EKS Access Entry: grant the caller cluster-admin via the Access Entries API ─
+  # eksctl adds the creator to aws-auth, but SSO roles (with their /aws-reserved/
+  # path) are sometimes rejected. Using the Access Entries API is more reliable
+  # and works regardless of the aws-auth ConfigMap state.
+  log "Granting cluster-admin access to caller IAM role via EKS Access Entries…"
+  CALLER_ARN=$(aws sts get-caller-identity \
+    --profile "$AWS_PROFILE" --query Arn --output text)
+  # Convert assumed-role STS ARN → IAM role ARN (strips session suffix, fixes path)
+  ROLE_NAME=$(echo "$CALLER_ARN" | sed 's|.*assumed-role/||;s|/.*||')
+  ROLE_ARN=$(aws iam get-role \
+    --profile "$AWS_PROFILE" \
+    --role-name "$ROLE_NAME" \
+    --query 'Role.Arn' --output text 2>/dev/null || true)
+  if [ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ]; then
+    aws eks create-access-entry \
+      --profile      "$AWS_PROFILE" \
+      --region       "$AWS_REGION" \
+      --cluster-name "$CLUSTER_NAME" \
+      --principal-arn "$ROLE_ARN" \
+      --type STANDARD 2>/dev/null || true   # ignore if entry already exists
+    aws eks associate-access-policy \
+      --profile      "$AWS_PROFILE" \
+      --region       "$AWS_REGION" \
+      --cluster-name "$CLUSTER_NAME" \
+      --principal-arn "$ROLE_ARN" \
+      --policy-arn   arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+      --access-scope type=cluster
+    ok "Cluster-admin access granted to $ROLE_ARN"
+  else
+    log "Caller is not an assumed role (IAM user?) — skipping Access Entry"
+  fi
+
 fi
 
 # ── kubectl: update kubeconfig ───────────────────────────────────────────────
@@ -292,9 +393,140 @@ aws eks update-kubeconfig \
   --alias   "$KUBECTL_CONTEXT"
 ok "kubectl context set to: $KUBECTL_CONTEXT"
 
+# Verify kubectl can reach the cluster before proceeding.
+# EKS exec credential plugins can take a few seconds to exchange tokens on
+# first use — retry until auth succeeds rather than failing immediately.
+log "Verifying kubectl connectivity…"
+for i in $(seq 1 12); do
+  if kubectl --context "$KUBECTL_CONTEXT" auth can-i '*' '*' --all-namespaces &>/dev/null; then
+    ok "kubectl connectivity verified"
+    break
+  fi
+  [ "$i" -eq 12 ] && die "kubectl cannot authenticate to cluster after 60 s — run: aws sso login --profile $AWS_PROFILE"
+  sleep 5
+done
+
+# ── External-DNS: IAM policy + IRSA service account (idempotent) ─────────────
+# Runs every deploy so adding External-DNS to an existing cluster works too.
+log "Ensuring External-DNS IAM policy exists…"
+EXTERNAL_DNS_POLICY_ARN=$(aws iam list-policies \
+  --profile "$AWS_PROFILE" \
+  --query   "Policies[?PolicyName=='ExternalDNS-${CLUSTER_NAME}'].Arn" \
+  --output  text 2>/dev/null || true)
+if [ -z "$EXTERNAL_DNS_POLICY_ARN" ] || [ "$EXTERNAL_DNS_POLICY_ARN" = "None" ]; then
+  EXTERNAL_DNS_POLICY_ARN=$(aws iam create-policy \
+    --profile      "$AWS_PROFILE" \
+    --policy-name  "ExternalDNS-${CLUSTER_NAME}" \
+    --policy-document '{
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": ["route53:ChangeResourceRecordSets"],
+          "Resource": ["arn:aws:route53:::hostedzone/*"]
+        },
+        {
+          "Effect": "Allow",
+          "Action": ["route53:ListHostedZones","route53:ListResourceRecordSets","route53:ListTagsForResource"],
+          "Resource": ["*"]
+        }
+      ]
+    }' \
+    --query 'Policy.Arn' --output text)
+fi
+ok "External-DNS IAM policy: $EXTERNAL_DNS_POLICY_ARN"
+
+log "Ensuring External-DNS IRSA service account exists…"
+eksctl create iamserviceaccount \
+  --name            external-dns \
+  --namespace       kube-system \
+  --cluster         "$CLUSTER_NAME" \
+  --region          "$AWS_REGION" \
+  --profile         "$AWS_PROFILE" \
+  --attach-policy-arn "$EXTERNAL_DNS_POLICY_ARN" \
+  --approve \
+  --override-existing-serviceaccounts
+ok "External-DNS service account ready"
+
+# ── cert-manager: IAM policy + IRSA (no kubectl needed here) ─────────────────
+log "Ensuring cert-manager IAM policy exists…"
+CERT_MANAGER_POLICY_ARN=$(aws iam list-policies \
+  --profile "$AWS_PROFILE" \
+  --query   "Policies[?PolicyName=='CertManager-${CLUSTER_NAME}'].Arn" \
+  --output  text 2>/dev/null || true)
+if [ -z "$CERT_MANAGER_POLICY_ARN" ] || [ "$CERT_MANAGER_POLICY_ARN" = "None" ]; then
+  CERT_MANAGER_POLICY_ARN=$(aws iam create-policy \
+    --profile     "$AWS_PROFILE" \
+    --policy-name "CertManager-${CLUSTER_NAME}" \
+    --policy-document '{
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": "route53:GetChange",
+          "Resource": "arn:aws:route53:::change/*"
+        },
+        {
+          "Effect": "Allow",
+          "Action": [
+            "route53:ChangeResourceRecordSets",
+            "route53:ListResourceRecordSets"
+          ],
+          "Resource": "arn:aws:route53:::hostedzone/*"
+        },
+        {
+          "Effect": "Allow",
+          "Action": "route53:ListHostedZonesByName",
+          "Resource": "*"
+        }
+      ]
+    }' \
+    --query 'Policy.Arn' --output text)
+fi
+ok "cert-manager IAM policy: $CERT_MANAGER_POLICY_ARN"
+
+log "Ensuring cert-manager IRSA service account…"
+eksctl create iamserviceaccount \
+  --name            cert-manager \
+  --namespace       cert-manager \
+  --cluster         "$CLUSTER_NAME" \
+  --region          "$AWS_REGION" \
+  --profile         "$AWS_PROFILE" \
+  --attach-policy-arn "$CERT_MANAGER_POLICY_ARN" \
+  --approve \
+  --override-existing-serviceaccounts
+ok "cert-manager IAM + IRSA prepared"
+
+# ── Istio: install service mesh (idempotent) ──────────────────────────────────
+log "Installing Istio service mesh…"
+istioctl install -f istio-operator.yaml --context "$KUBECTL_CONTEXT" -y
+ok "Istio installed"
+
 # ── K8s: namespace ───────────────────────────────────────────────────────────
 log "Applying namespace"
 kubectl --context "$KUBECTL_CONTEXT" apply -f k8s/00-namespace.yaml
+
+# Label for automatic sidecar injection before any pods are created
+kubectl --context "$KUBECTL_CONTEXT" label namespace "$NAMESPACE" \
+  istio-injection=enabled --overwrite
+ok "Namespace labeled for Istio sidecar injection"
+
+# ── cert-manager: install CRDs + wait + restart controller with IRSA ─────────
+# Done here (after namespace) so kubectl auth is already confirmed working.
+log "Installing cert-manager (Let's Encrypt TLS)"
+kubectl --context "$KUBECTL_CONTEXT" apply --validate=false \
+  -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+log "Waiting for cert-manager webhook to be ready…"
+kubectl --context "$KUBECTL_CONTEXT" wait \
+  --for=condition=Available deployment/cert-manager-webhook \
+  --namespace cert-manager --timeout=5m
+ok "cert-manager ready"
+log "Restarting cert-manager controller to load IRSA credentials…"
+kubectl --context "$KUBECTL_CONTEXT" rollout restart deployment/cert-manager \
+  --namespace cert-manager
+kubectl --context "$KUBECTL_CONTEXT" rollout status deployment/cert-manager \
+  --namespace cert-manager --timeout=3m
+ok "cert-manager IRSA ready"
 
 # ── K8s: PDC secret from .env ────────────────────────────────────────────────
 log "Creating PDC secret from .env"
@@ -306,6 +538,9 @@ fi
 pdc_token=$(grep -E '^GCLOUD_PDC_SIGNING_TOKEN=' .env | cut -d= -f2- | tr -d '"'"'" || true)
 pdc_cluster=$(grep -E '^GCLOUD_PDC_CLUSTER=' .env | cut -d= -f2- | tr -d '"'"'" || true)
 grafana_id=$(grep -E '^GCLOUD_HOSTED_GRAFANA_ID=' .env | cut -d= -f2- | tr -d '"'"'" || true)
+CERT_EMAIL=$(grep -E '^CERT_EMAIL=' .env | cut -d= -f2- | tr -d '"'"'" || true)
+[ -z "$CERT_EMAIL" ] && die ".env is missing CERT_EMAIL (required for Let's Encrypt)"
+export CERT_EMAIL
 
 kubectl --context "$KUBECTL_CONTEXT" create secret generic pdc-credentials \
   --namespace "$NAMESPACE" \
@@ -316,14 +551,46 @@ kubectl --context "$KUBECTL_CONTEXT" create secret generic pdc-credentials \
 | kubectl --context "$KUBECTL_CONTEXT" apply -f -
 ok "PDC secret applied"
 
-# ── K8s: apply remaining manifests with ECR_REGISTRY substituted ─────────────
+# ── K8s: frontend basic-auth credentials from .env ────────────────────────────
+log "Creating frontend-credentials secret from .env"
+frontend_user=$(grep -E '^FRONTEND_USER=' .env | cut -d= -f2- | tr -d '"'"'" || true)
+frontend_password=$(grep -E '^FRONTEND_PASSWORD=' .env | cut -d= -f2- | tr -d '"'"'" || true)
+[ -z "$frontend_user" ]     && die ".env is missing FRONTEND_USER"
+[ -z "$frontend_password" ] && die ".env is missing FRONTEND_PASSWORD"
+
+kubectl --context "$KUBECTL_CONTEXT" create secret generic frontend-credentials \
+  --namespace "$NAMESPACE" \
+  --from-literal="username=${frontend_user}" \
+  --from-literal="password=${frontend_password}" \
+  --dry-run=client -o yaml \
+| kubectl --context "$KUBECTL_CONTEXT" apply -f -
+ok "Frontend credentials secret applied"
+
+# ── K8s: apply remaining manifests ───────────────────────────────────────────
+# Use explicit variable list so nginx-config ConfigMaps aren't broken by
+# envsubst substituting nginx variables like $host or $remote_addr.
 log "Applying Kubernetes manifests"
+ENVSUBST_VARS='${ECR_REGISTRY} ${ECR_REPO} ${IMAGE_TAG} ${HOSTNAME_PREFIX} ${DNS_DOMAIN} ${AWS_REGION} ${CLUSTER_NAME} ${CERT_EMAIL} ${HOSTED_ZONE_ID_SHORT}'
 for manifest in k8s/*.yaml; do
   # 00-namespace.yaml already applied above; skip to avoid duplicate warning
   [[ "$manifest" == "k8s/00-namespace.yaml" ]] && continue
-  envsubst < "$manifest" | kubectl --context "$KUBECTL_CONTEXT" apply -f -
+  envsubst "$ENVSUBST_VARS" < "$manifest" | kubectl --context "$KUBECTL_CONTEXT" apply -f -
 done
 ok "All manifests applied"
+
+# ── Istio: restart pods that don't yet have the sidecar injected ──────────────
+# On first deploy the namespace was labeled before pods were created, so sidecars
+# are already present. On re-deploy to an existing cluster that didn't have Istio,
+# a rolling restart is needed to inject the sidecar into existing pods.
+if kubectl --context "$KUBECTL_CONTEXT" get pods -n "$NAMESPACE" \
+     -o jsonpath='{.items[*].spec.containers[*].name}' 2>/dev/null \
+   | tr ' ' '\n' | grep -q 'istio-proxy'; then
+  ok "Istio sidecars already present"
+else
+  log "Restarting deployments to inject Istio sidecars…"
+  kubectl --context "$KUBECTL_CONTEXT" rollout restart deployment \
+    --namespace "$NAMESPACE"
+fi
 
 # ── Wait for rollout ──────────────────────────────────────────────────────────
 log "Waiting for deployments to be ready"
@@ -342,32 +609,41 @@ echo "════════════════════════�
 echo "  Travel App — Public Endpoints"
 echo "════════════════════════════════════════"
 
-grafana_hostname=""
-for svc in frontend grafana; do
-  hostname=""
+# Collect LB hostnames (poll until provisioned, up to ~2 min each)
+get_hostname() {
+  local svc="$1"
+  local hostname=""
   for i in $(seq 1 20); do
     hostname=$(kubectl --context "$KUBECTL_CONTEXT" get svc "$svc" \
       --namespace "$NAMESPACE" \
       -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-    [ -n "$hostname" ] && break
+    [ -n "$hostname" ] && echo "$hostname" && return
     sleep 6
   done
-  if [ -n "$hostname" ]; then
-    echo "  ${svc}: http://${hostname}${svc:+$([ "$svc" = grafana ] && echo ':3000')}"
-    [ "$svc" = "grafana" ] && grafana_hostname="$hostname"
-  else
-    echo "  ${svc}: (pending — run: kubectl get svc ${svc} -n ${NAMESPACE})"
-  fi
-done
-echo "════════════════════════════════════════"
+}
 
-# ── Inject Grafana URL into frontend ─────────────────────────────────────────
-if [ -n "$grafana_hostname" ]; then
-  log "Setting GRAFANA_URL on frontend deployment"
-  kubectl --context "$KUBECTL_CONTEXT" set env deployment/frontend \
-    --namespace "$NAMESPACE" \
-    GRAFANA_URL="http://${grafana_hostname}:3000"
-  kubectl --context "$KUBECTL_CONTEXT" rollout status deployment/frontend \
-    --namespace "$NAMESPACE" --timeout=5m
-  ok "Frontend updated with Grafana URL: http://${grafana_hostname}:3000"
-fi
+# ── Inject Grafana URL into frontend using persistent DNS hostname ────────────
+# Use the DNS name immediately — External-DNS will have it live within seconds.
+GRAFANA_DNS="https://${HOSTNAME_PREFIX}grafana.${DNS_DOMAIN}"
+log "Setting GRAFANA_URL on frontend deployment: $GRAFANA_DNS"
+kubectl --context "$KUBECTL_CONTEXT" set env deployment/frontend \
+  --namespace "$NAMESPACE" \
+  GRAFANA_URL="$GRAFANA_DNS"
+kubectl --context "$KUBECTL_CONTEXT" rollout status deployment/frontend \
+  --namespace "$NAMESPACE" --timeout=5m
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo "  Travel App — deployed to $CLUSTER_NAME"
+echo "════════════════════════════════════════════════════════"
+echo "  Frontend  →  https://${HOSTNAME_PREFIX}frontend.${DNS_DOMAIN}"
+echo "  Grafana   →  https://${HOSTNAME_PREFIX}grafana.${DNS_DOMAIN}"
+echo "  Alloy UI  →  https://${HOSTNAME_PREFIX}alloy.${DNS_DOMAIN}"
+echo ""
+echo "  DNS records are managed by External-DNS and may take"
+echo "  up to 60 seconds to propagate on first deploy."
+echo ""
+echo "  TLS certificates are issued by Let's Encrypt via cert-manager."
+echo "  On first deploy certificate issuance may take 2–5 minutes."
+echo "════════════════════════════════════════════════════════"

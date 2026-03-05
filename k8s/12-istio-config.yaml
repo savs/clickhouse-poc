@@ -1,0 +1,26 @@
+# Enable Istio access logging mesh-wide, shipping to the OTel collector
+# (which writes to otel_logs in ClickHouse).
+# The otel-access-log provider is defined in istio-operator.yaml.
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: mesh-access-log
+  namespace: istio-system
+spec:
+  accessLogging:
+    - providers:
+        - name: otel-access-log
+---
+# ClickHouse does not speak mTLS — allow plaintext connections to it.
+# All other service-to-service traffic uses automatic mTLS.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: clickhouse-permissive
+  namespace: travel-app
+spec:
+  selector:
+    matchLabels:
+      app: clickhouse
+  mtls:
+    mode: PERMISSIVE

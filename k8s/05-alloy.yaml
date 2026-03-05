@@ -52,6 +52,68 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+
+        # nginx sidecar: terminates TLS, enforces basic auth, proxies to Alloy UI.
+        - name: nginx-tls
+          image: nginx:alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              printf '%s:%s\n' "$FRONTEND_USER" "$(openssl passwd -apr1 "$FRONTEND_PASSWORD")" \
+                > /etc/nginx/.htpasswd
+              mkdir -p /etc/nginx/ssl-live
+              if [ -f /etc/nginx/ssl/tls.crt ]; then
+                cp /etc/nginx/ssl/tls.crt /etc/nginx/ssl-live/tls.crt
+                cp /etc/nginx/ssl/tls.key /etc/nginx/ssl-live/tls.key
+              else
+                openssl req -x509 -newkey rsa:2048 -keyout /etc/nginx/ssl-live/tls.key \
+                  -out /etc/nginx/ssl-live/tls.crt -days 1 -nodes -subj "/CN=placeholder"
+              fi
+              ( while true; do sleep 60
+                  if [ -f /etc/nginx/ssl/tls.crt ]; then
+                    if ! diff -q /etc/nginx/ssl/tls.crt /etc/nginx/ssl-live/tls.crt >/dev/null 2>&1; then
+                      cp /etc/nginx/ssl/tls.crt /etc/nginx/ssl-live/tls.crt
+                      cp /etc/nginx/ssl/tls.key /etc/nginx/ssl-live/tls.key
+                      nginx -s reload 2>/dev/null || true
+                    fi
+                  fi
+                done ) &
+              exec nginx -g 'daemon off;'
+          env:
+            - name: FRONTEND_USER
+              valueFrom:
+                secretKeyRef:
+                  name: frontend-credentials
+                  key: username
+            - name: FRONTEND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: frontend-credentials
+                  key: password
+          ports:
+            - containerPort: 80
+            - containerPort: 443
+          volumeMounts:
+            - name: alloy-tls
+              mountPath: /etc/nginx/ssl
+              readOnly: true
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 443
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
       volumes:
         - name: config
           configMap:
@@ -59,7 +121,15 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: alloy-data
+        - name: alloy-tls
+          secret:
+            secretName: alloy-tls
+            optional: true   # pod starts before cert-manager issues the cert
+        - name: nginx-config
+          configMap:
+            name: alloy-nginx-config
 ---
+# Internal ClusterIP service — used by other pods to send OTLP telemetry.
 apiVersion: v1
 kind: Service
 metadata:
@@ -75,6 +145,24 @@ spec:
     - name: otlp-http
       port: 4318
       targetPort: 4318
-    - name: ui
-      port: 12345
-      targetPort: 12345
+---
+# External LoadBalancer service — exposes the Alloy UI via HTTPS with basic auth.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy-ui
+  namespace: travel-app
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "owner=${ECR_REPO},project=travel-app"
+    external-dns.alpha.kubernetes.io/hostname: ${HOSTNAME_PREFIX}alloy.${DNS_DOMAIN}
+spec:
+  type: LoadBalancer
+  selector:
+    app: alloy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443

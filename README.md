@@ -334,6 +334,7 @@ GCLOUD_HOSTED_GRAFANA_ID=<your-grafana-id>
 
 | Flag | Description |
 |------|-------------|
+| `-domain <domain>` | **Required.** Route 53 hosted zone to use for DNS (e.g. `-domain grafana-demo.com`). Must exist in Route 53 before deploying. |
 | `-prefix <name>` | Prefix all AWS resources with your name (e.g. `-prefix alice` → cluster `alice-travel-app`). Recommended when sharing an AWS account. |
 | `-version <tag>` | Pin images to an explicit tag. Defaults to the current git commit hash. Images already in ECR with that tag are skipped. |
 | `-clean` | Delete the existing cluster, ECR repository, and all images before redeploying. Useful for a fresh start. |
@@ -342,16 +343,16 @@ GCLOUD_HOSTED_GRAFANA_ID=<your-grafana-id>
 
 ```bash
 # First-time deploy, owned by alice
-./deploy_k8s.sh -prefix alice
+./deploy_k8s.sh -domain grafana-demo.com -prefix alice
 
 # Redeploy after code changes (only changed images are rebuilt)
-./deploy_k8s.sh -prefix alice
+./deploy_k8s.sh -domain grafana-demo.com -prefix alice
 
 # Tear everything down and start fresh
-./deploy_k8s.sh -prefix alice -clean
+./deploy_k8s.sh -domain grafana-demo.com -prefix alice -clean
 
 # Pin to a specific image version
-./deploy_k8s.sh -prefix alice -version v1.2.3
+./deploy_k8s.sh -domain grafana-demo.com -prefix alice -version v1.2.3
 ```
 
 The script will:

@@ -12,5 +12,5 @@ RUN mv /usr/share/nginx/html/index.html /usr/share/nginx/html/index.html.tmpl
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
-EXPOSE 80
+EXPOSE 80 443
 CMD ["/docker-entrypoint.sh"]

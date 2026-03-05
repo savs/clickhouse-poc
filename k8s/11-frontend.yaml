@@ -18,6 +18,22 @@ spec:
           image: ${ECR_REGISTRY}/${ECR_REPO}:frontend-${IMAGE_TAG}
           ports:
             - containerPort: 80
+            - containerPort: 443
+          env:
+            - name: FRONTEND_USER
+              valueFrom:
+                secretKeyRef:
+                  name: frontend-credentials
+                  key: username
+            - name: FRONTEND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: frontend-credentials
+                  key: password
+          volumeMounts:
+            - name: frontend-tls
+              mountPath: /etc/nginx/ssl
+              readOnly: true
           resources:
             requests:
               cpu: 50m
@@ -25,6 +41,11 @@ spec:
             limits:
               cpu: 200m
               memory: 128Mi
+      volumes:
+        - name: frontend-tls
+          secret:
+            secretName: frontend-tls
+            optional: true   # pod starts before cert-manager issues the cert
 ---
 apiVersion: v1
 kind: Service
@@ -33,10 +54,15 @@ metadata:
   namespace: travel-app
   annotations:
     service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "owner=${ECR_REPO},project=travel-app"
+    external-dns.alpha.kubernetes.io/hostname: ${HOSTNAME_PREFIX}frontend.${DNS_DOMAIN}
 spec:
   type: LoadBalancer
   selector:
     app: frontend
   ports:
-    - port: 80
+    - name: http
+      port: 80
       targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443
