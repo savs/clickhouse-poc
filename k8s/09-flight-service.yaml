@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flight-service
+  namespace: travel-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flight-service
+  template:
+    metadata:
+      labels:
+        app: flight-service
+    spec:
+      containers:
+        - name: flight-service
+          image: ${ECR_REGISTRY}/${ECR_REPO}:flight-service-${IMAGE_TAG}
+          ports:
+            - containerPort: 3002
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: flight-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://alloy:4318
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flight-service
+  namespace: travel-app
+spec:
+  selector:
+    app: flight-service
+  ports:
+    - port: 3002
+      targetPort: 3002

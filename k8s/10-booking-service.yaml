@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-service
+  namespace: travel-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: booking-service
+  template:
+    metadata:
+      labels:
+        app: booking-service
+    spec:
+      containers:
+        - name: booking-service
+          image: ${ECR_REGISTRY}/${ECR_REPO}:booking-service-${IMAGE_TAG}
+          ports:
+            - containerPort: 4000
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: booking-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://alloy:4318
+            - name: HOTEL_SERVICE_URL
+              value: http://hotel-service:3001
+            - name: FLIGHT_SERVICE_URL
+              value: http://flight-service:3002
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: booking-service
+  namespace: travel-app
+spec:
+  selector:
+    app: booking-service
+  ports:
+    - port: 4000
+      targetPort: 4000

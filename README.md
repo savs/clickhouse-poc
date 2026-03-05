@@ -296,3 +296,130 @@ Verify `GCLOUD_PDC_SIGNING_TOKEN`, `GCLOUD_PDC_CLUSTER`, and `GCLOUD_HOSTED_GRAF
 - The ClickHouse exporter TTL is set to 72 hours — adjust `ttl` in `otelcol/config.yaml` as needed
 - Disable `GF_AUTH_ANONYMOUS_ENABLED` and `GF_AUTH_ANONYMOUS_ORG_ROLE` in `docker-compose.yml`
 - The Docker socket mount on Alloy (`/var/run/docker.sock`) gives Alloy read access to all container metadata — scope appropriately in production
+
+
+## Deploying to AWS EKS
+
+The `deploy_k8s.sh` script handles the full lifecycle: ECR repo creation, cross-compiled image builds, EKS cluster creation, and manifest deployment.
+
+### Prerequisites
+
+Install the required tools:
+
+```bash
+brew install awscli eksctl kubectl
+# docker with buildx is included in Docker Desktop
+```
+
+Configure AWS access if not already done:
+
+```bash
+aws configure --profile grafana-dev
+aws sts get-caller-identity --profile grafana-dev
+```
+
+Ensure your `.env` file is present with PDC credentials (same as for local Docker Compose):
+
+```
+GCLOUD_PDC_SIGNING_TOKEN=<your-pdc-token>
+GCLOUD_PDC_CLUSTER=<your-pdc-cluster>
+GCLOUD_HOSTED_GRAFANA_ID=<your-grafana-id>
+```
+
+### Deploy
+
+```bash
+./deploy_k8s.sh [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-prefix <name>` | Prefix all AWS resources with your name (e.g. `-prefix alice` → cluster `alice-travel-app`). Recommended when sharing an AWS account. |
+| `-version <tag>` | Pin images to an explicit tag. Defaults to the current git commit hash. Images already in ECR with that tag are skipped. |
+| `-clean` | Delete the existing cluster, ECR repository, and all images before redeploying. Useful for a fresh start. |
+
+**Examples:**
+
+```bash
+# First-time deploy, owned by alice
+./deploy_k8s.sh -prefix alice
+
+# Redeploy after code changes (only changed images are rebuilt)
+./deploy_k8s.sh -prefix alice
+
+# Tear everything down and start fresh
+./deploy_k8s.sh -prefix alice -clean
+
+# Pin to a specific image version
+./deploy_k8s.sh -prefix alice -version v1.2.3
+```
+
+The script will:
+
+1. **ECR** — Create the ECR repository if it doesn't exist
+2. **Build & push** — Cross-compile custom images (`grafana`, `hotel-service`, `flight-service`, `booking-service`, `frontend`) from arm64 → `linux/amd64` and push to ECR; skips images already present at the current version tag
+3. **EKS cluster** — Create the cluster via `eksctl` if one doesn't exist (~15 min first time); uses `t3.medium` nodes on Kubernetes 1.33
+4. **OIDC + EBS CSI** — Associate an IAM OIDC provider and install the EBS CSI driver with IRSA so persistent volumes work
+5. **kubeconfig** — Adds a context matching the cluster name to `~/.kube/config`
+6. **Namespace** — Creates the `travel-app` namespace
+7. **PDC secret** — Creates a K8s Secret from your `.env` file
+8. **Manifests** — Applies all manifests in `k8s/` in order
+9. **Grafana URL** — Injects the Grafana LoadBalancer address into the frontend so the header link works
+10. **Endpoints** — Prints the public LoadBalancer URLs for `frontend` and `grafana`
+
+#### Resource naming with `-prefix`
+
+All AWS resources are namespaced by prefix so multiple developers can share the same account without conflicts:
+
+| Resource | Without prefix | With `-prefix alice` |
+|----------|---------------|----------------------|
+| EKS cluster | `travel-app` | `alice-travel-app` |
+| ECR repository | `travel-app` | `alice-travel-app` |
+| CloudFormation stack | `eksctl-travel-app-cluster` | `eksctl-alice-travel-app-cluster` |
+| EKS + ECR tags | `owner=shared` | `owner=alice-travel-app` |
+
+#### What `-clean` deletes
+
+- EKS cluster (and its CloudFormation stacks, node groups, IAM roles)
+- ECR repository and all images
+- ELBs and EBS volumes are released first via namespace deletion to avoid CloudFormation getting stuck
+
+### Kubernetes layout
+
+```
+k8s/
+├── 00-namespace.yaml              # Namespace: travel-app
+├── 00-configmap-clickhouse-init.yaml
+├── 01-configmap-otelcol.yaml
+├── 02-configmap-alloy.yaml        # Alloy config (K8s-adapted; no Docker socket)
+├── 03-clickhouse.yaml             # Deployment + Service + PVC (10 Gi)
+├── 04-otelcol.yaml                # Deployment + Service
+├── 05-alloy.yaml                  # Deployment + Service + PVC (1 Gi)
+├── 06-pdc.yaml                    # Deployment (reads pdc-credentials secret)
+├── 07-grafana.yaml                # Deployment + LoadBalancer Service :3000 + PVC (5 Gi)
+├── 08-hotel-service.yaml          # Deployment + Service :3001
+├── 09-flight-service.yaml         # Deployment + Service :3002
+├── 10-booking-service.yaml        # Deployment + Service :4000
+└── 11-frontend.yaml               # Deployment + LoadBalancer Service :80
+```
+
+Public services use `type: LoadBalancer` (AWS NLB); all other services are `ClusterIP` only.
+
+### Accessing the cluster after deploy
+
+The kubectl context name matches the cluster name (`travel-app` or `<prefix>-travel-app`):
+
+```bash
+# Use the kubectl context (substitute your prefix if set)
+kubectl --context alice-travel-app get all -n travel-app
+
+# Get public endpoints
+kubectl --context alice-travel-app get svc -n travel-app
+
+# Tail logs for a service
+kubectl --context alice-travel-app logs -n travel-app -l app=booking-service -f
+```
+
+### Notes on Docker log collection
+
+In Docker Compose, Alloy collects container logs via the Docker socket. In Kubernetes the socket is not available to regular pods, so the `k8s/02-configmap-alloy.yaml` config omits that section. Traces and metrics flow normally. For production log collection in K8s, deploy Alloy as a DaemonSet with a `hostPath` mount of `/var/log/pods` and use `loki.source.file` with `discovery.kubernetes`.

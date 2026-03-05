@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-init
+  namespace: travel-app
+data:
+  01-init.sql: |
+    -- Initialize ClickHouse database with sample tables
+
+    CREATE TABLE IF NOT EXISTS default.metrics (
+        timestamp DateTime,
+        metric_name String,
+        value Float64,
+        tags Map(String, String)
+    ) ENGINE = MergeTree()
+    ORDER BY (metric_name, timestamp);
+
+    CREATE TABLE IF NOT EXISTS default.logs (
+        timestamp DateTime,
+        level String,
+        message String,
+        service String,
+        host String
+    ) ENGINE = MergeTree()
+    ORDER BY (timestamp, service);
+
+    CREATE TABLE IF NOT EXISTS default.traces (
+        trace_id String,
+        span_id String,
+        parent_span_id String,
+        operation_name String,
+        start_time DateTime64(9),
+        duration_ns UInt64,
+        service_name String,
+        tags Map(String, String)
+    ) ENGINE = MergeTree()
+    ORDER BY (service_name, start_time);

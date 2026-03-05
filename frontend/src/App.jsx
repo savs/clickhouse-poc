@@ -267,7 +267,7 @@ export default function App() {
         <span style={{ fontSize: 26 }}>✈️</span>
         <span style={{ fontSize: 20, fontWeight: 700 }}>Travel Booking</span>
         <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 20 }}>
-          <a href="http://localhost:3000" target="_blank" rel="noreferrer"
+          <a href={window.__GRAFANA_URL__ || 'http://localhost:3000'} target="_blank" rel="noreferrer"
             style={{ color: '#fff', fontSize: 13, fontWeight: 600, textDecoration: 'none', opacity: 0.85, display: 'flex', alignItems: 'center', gap: 6 }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
             Grafana

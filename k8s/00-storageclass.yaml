@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: travel-app-ebs
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp2
+  tagSpecification_1: "owner=${ECR_REPO}"
+  tagSpecification_2: "project=travel-app"
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+allowVolumeExpansion: true
