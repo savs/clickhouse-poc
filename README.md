@@ -112,6 +112,8 @@ GCLOUD_HOSTED_GRAFANA_ID=<your-grafana-id>
 
 ```bash
 docker compose up --build -d
+# or
+./start.sh   # runs docker compose down -v && docker compose up --build (foreground, wipes volumes)
 ```
 
 On first start, Grafana installs the ClickHouse plugin — allow ~30 seconds before the datasource is ready.
@@ -245,6 +247,21 @@ LIMIT 100
 
 ## Managing the Stack
 
+A `Makefile` provides shortcuts for the most common operations:
+
+```bash
+make up        # docker compose up -d
+make down      # docker compose down
+make restart   # docker compose restart
+make logs      # tail all container logs
+make clean     # docker compose down -v (prompts for confirmation)
+make clickhouse # open ClickHouse client
+make status    # docker compose ps
+make test      # send a test OTLP metric to Alloy
+```
+
+Or use `docker compose` directly:
+
 ```bash
 # View logs for a specific service
 docker compose logs -f booking-service
@@ -318,12 +335,22 @@ aws configure --profile grafana-dev
 aws sts get-caller-identity --profile grafana-dev
 ```
 
-Ensure your `.env` file is present with PDC credentials (same as for local Docker Compose):
+Ensure your `.env` file is present. The EKS deploy requires additional variables beyond the local stack:
 
 ```
+# Grafana Cloud PDC — required for both local and EKS
 GCLOUD_PDC_SIGNING_TOKEN=<your-pdc-token>
 GCLOUD_PDC_CLUSTER=<your-pdc-cluster>
 GCLOUD_HOSTED_GRAFANA_ID=<your-grafana-id>
+
+# EKS-specific
+CERT_EMAIL=<email-for-lets-encrypt-registration>
+FRONTEND_USER=<basic-auth-username>
+FRONTEND_PASSWORD=<basic-auth-password>
+
+# Load testing — only needed for run_load_test.sh
+K6_TOKEN=<k6-cloud-token>
+K6_CLOUD_PROJECT_ID=<k6-cloud-project-id>
 ```
 
 ### Deploy
@@ -394,21 +421,51 @@ All AWS resources are namespaced by prefix so multiple developers can share the 
 ```
 k8s/
 ├── 00-namespace.yaml              # Namespace: travel-app
+├── 00-storageclass.yaml           # Custom gp2 EBS StorageClass (travel-app-ebs)
 ├── 00-configmap-clickhouse-init.yaml
 ├── 01-configmap-otelcol.yaml
-├── 02-configmap-alloy.yaml        # Alloy config (K8s-adapted; no Docker socket)
+├── 02-configmap-alloy.yaml        # Alloy config (K8s-adapted; reads pod logs via K8s API)
 ├── 03-clickhouse.yaml             # Deployment + Service + PVC (10 Gi)
 ├── 04-otelcol.yaml                # Deployment + Service
-├── 05-alloy.yaml                  # Deployment + Service + PVC (1 Gi)
+├── 05-alloy.yaml                  # Deployment + LoadBalancer Service :4317/:4318 + PVC (1 Gi)
 ├── 06-pdc.yaml                    # Deployment (reads pdc-credentials secret)
 ├── 07-grafana.yaml                # Deployment + LoadBalancer Service :3000 + PVC (5 Gi)
 ├── 08-hotel-service.yaml          # Deployment + Service :3001
 ├── 09-flight-service.yaml         # Deployment + Service :3002
 ├── 10-booking-service.yaml        # Deployment + Service :4000
-└── 11-frontend.yaml               # Deployment + LoadBalancer Service :80
+├── 11-frontend.yaml               # Deployment + LoadBalancer Service :80
+├── 12-istio-config.yaml           # Telemetry + PeerAuthentication (see Istio section)
+├── 13-external-dns.yaml           # External-DNS RBAC + Deployment
+├── 14-cert-issuer.yaml            # Let's Encrypt ClusterIssuer via Route 53 DNS-01
+├── 15-certificates.yaml           # TLS certificates for frontend, grafana, alloy
+├── 16-nginx-proxy-configs.yaml    # nginx ConfigMaps: TLS termination + basic auth
+└── 17-alloy-rbac.yaml             # ServiceAccount + ClusterRole for Alloy pod log access
 ```
 
-Public services use `type: LoadBalancer` (AWS NLB); all other services are `ClusterIP` only.
+Three services are publicly exposed via `type: LoadBalancer` (AWS NLB): `frontend` (:80/:443), `grafana` (:80/:443), and `alloy` (:4317/:4318). All other services are `ClusterIP` only. nginx sidecars handle TLS termination and basic auth in front of each public LoadBalancer (see HTTPS section below).
+
+### HTTPS, certificates, and External-DNS
+
+The EKS deployment serves all three public endpoints over HTTPS. The infrastructure that makes this work:
+
+**External-DNS** — Installed in `kube-system`. Watches `LoadBalancer` services and automatically creates Route 53 A/ALIAS records pointing at the AWS NLB addresses. This is what makes `<prefix>frontend.<domain>` resolve without any manual DNS work. It uses an IAM policy + IRSA service account created by the deploy script.
+
+**cert-manager** — Installed via Helm. Issues and renews TLS certificates from Let's Encrypt using the DNS-01 challenge via Route 53 (no inbound HTTP required). Needs its own IAM policy + IRSA service account for Route 53 access. The `CERT_EMAIL` in `.env` is registered with Let's Encrypt.
+
+**Certificates** — Three `Certificate` resources (in `15-certificates.yaml`) request certs for:
+- `<prefix>frontend.<domain>`
+- `<prefix>grafana.<domain>`
+- `<prefix>alloy.<domain>`
+
+Cert-manager stores the issued certificates as K8s Secrets (`frontend-tls`, `grafana-tls`, `alloy-tls`).
+
+**nginx sidecars** — Each public service pod runs an nginx sidecar (configured via `16-nginx-proxy-configs.yaml`) that:
+- Listens on `:443`, terminates TLS using the cert-manager secret
+- Enforces HTTP basic auth via the `nginx-htpasswd` secret (generated from `FRONTEND_USER`/`FRONTEND_PASSWORD` in `.env` by the deploy script)
+- Redirects `:80` → `:443`
+- Proxies authenticated requests to the main container on localhost
+
+The `FRONTEND_USER` and `FRONTEND_PASSWORD` in `.env` are used for all three public services (frontend, grafana, alloy).
 
 ### Accessing the cluster after deploy
 
@@ -450,6 +507,124 @@ The EKS deployment runs [Istio](https://istio.io/) (installed with `istioctl` us
 - If a pod exposes a port in its spec but nothing is listening on that port in the container, the Istio sidecar returns `426 Upgrade Required` to clients that try to connect — this is how connection failures surface through the mesh rather than as a TCP reset.
 - The `frontend-credentials` K8s secret is no longer mounted into nginx containers as env vars. The htpasswd file is pre-generated by the deploy script and mounted via the `nginx-htpasswd` secret, because `openssl` is not included in `nginx:alpine`.
 
-### Notes on Docker log collection
+### Fault injection
 
-In Docker Compose, Alloy collects container logs via the Docker socket. In Kubernetes the socket is not available to regular pods, so the `k8s/02-configmap-alloy.yaml` config omits that section. Traces and metrics flow normally. For production log collection in K8s, deploy Alloy as a DaemonSet with a `hostPath` mount of `/var/log/pods` and use `loki.source.file` with `discovery.kubernetes`.
+The `fault_inject.sh` script injects Istio faults into the live cluster via `VirtualService` resources — no application code changes required. Use it to generate interesting telemetry for demos or to test observability dashboards under degraded conditions.
+
+**Prerequisites:** Istio must be installed and the cluster must be running. Authenticate with AWS SSO before running:
+
+```bash
+aws sso login --profile <prefix>-travel-app
+```
+
+**Usage:**
+
+```bash
+./fault_inject.sh <scenario> [-prefix <name>]
+```
+
+| Scenario | Effect |
+|----------|--------|
+| `slow-hotels` | 50% of hotel-service requests delayed 3 s |
+| `flaky-flights` | 25% of flight-service requests return 503 |
+| `checkout-chaos` | booking-service: 20% slow (2 s) + 10% errors (503) |
+| `total-outage` | booking-service returns 503 for 100% of requests |
+| `cascading` | hotel-service 75% slow (2 s) + flight-service 40% errors — booking-service times out trying to aggregate |
+| `clear` | Remove all injected faults and restore normal traffic |
+| `status` | Show which fault VirtualServices are currently active |
+
+**Examples:**
+
+```bash
+# Inject a delay on hotel searches
+./fault_inject.sh slow-hotels -prefix alice
+
+# Simulate a cascading failure across services
+./fault_inject.sh cascading -prefix alice
+
+# Check what faults are active
+./fault_inject.sh status -prefix alice
+
+# Remove all faults
+./fault_inject.sh clear -prefix alice
+```
+
+Faults are applied as Istio `VirtualService` resources in the `travel-app` namespace and take effect immediately without restarting pods. Run `clear` to remove them all at once.
+
+### Load testing
+
+`load-test.js` is a [k6](https://k6.io/) script that simulates realistic user journeys against the deployed cluster. `run_load_test.sh` is the wrapper that reads credentials from `.env` and invokes k6.
+
+**Install k6:**
+```bash
+brew install k6
+```
+
+**Run locally against the EKS cluster:**
+```bash
+./run_load_test.sh -url https://<prefix>frontend.<domain>
+```
+
+**Run on k6 Cloud** (requires `K6_TOKEN` and optionally `K6_CLOUD_PROJECT_ID` in `.env`):
+```bash
+./run_load_test.sh -url https://<prefix>frontend.<domain> -cloud
+```
+
+**Additional flags:**
+
+| Flag | Description |
+|------|-------------|
+| `-url <url>` | **Required.** Base URL of the frontend |
+| `-cloud` | Run on k6 Cloud instead of locally |
+| `-vus <n>` | Override peak virtual users |
+| `-duration <t>` | Override total test duration (e.g. `5m`) |
+| `-script <path>` | Use an alternative k6 script |
+
+**Load profile** (default, from `load-test.js`):
+
+| Stage | Duration | VUs |
+|-------|----------|-----|
+| Ramp up | 30 s | 0 → 5 |
+| Sustain | 2 min | 10 |
+| Spike | 30 s | → 25 |
+| Sustain spike | 1 min | 25 |
+| Ramp down | 30 s | → 5 |
+| Drain | 30 s | → 0 |
+
+**User journey simulated:**
+1. Load homepage (basic auth)
+2. Search hotels + flights via GraphQL
+3. View individual hotel detail (40% of users)
+4. View individual flight detail (40% of users)
+5. Book a trip — hotel-only, flight-only, or both (70% of users who got results)
+
+**Custom metrics tracked:** `search_errors`, `booking_errors`, `booking_duration_ms`
+
+**Thresholds:** p95 < 3 s, p99 < 8 s for all requests; p95 < 5 s for booking mutations; error rates < 5%.
+
+The load test uses the same `FRONTEND_USER`/`FRONTEND_PASSWORD` credentials from `.env` for basic auth.
+
+### Tearing down
+
+`teardown.sh` does a more complete cleanup than `deploy_k8s.sh -clean`. Use it when you want to remove all traces of a deployment:
+
+```bash
+./teardown.sh -domain <domain> [-prefix <name>] [-profile <aws-profile>]
+```
+
+What it deletes, in order:
+
+1. `travel-app` Kubernetes namespace (triggers ELB and EBS volume deprovisioning)
+2. External-DNS deployment (stops DNS reconciliation)
+3. `cert-manager` and `istio-system` namespaces
+4. Route 53 A and TXT records for `frontend`, `grafana`, and `alloy` subdomains
+5. EKS cluster via `eksctl` (~10 minutes)
+6. IAM policies: `ExternalDNS-<cluster>` and `CertManager-<cluster>`
+7. ECR repository and all images
+8. Local kubeconfig context
+
+The script requires confirmation: you must type the cluster name before it proceeds. It also prints the correct command if the cluster name doesn't match any running cluster.
+
+### Log collection in Kubernetes
+
+In Docker Compose, Alloy collects container logs via the Docker socket. In Kubernetes the socket is not available to regular pods, so a different approach is used: `k8s/17-alloy-rbac.yaml` grants Alloy a `ClusterRole` with pod/log read permissions, and the Alloy config in `k8s/02-configmap-alloy.yaml` uses `loki.source.kubernetes` to stream container stdout/stderr via the Kubernetes API. Traces and metrics flow via OTLP as in the local stack.
