@@ -1,5 +1,5 @@
-# Enable Istio access logging mesh-wide, shipping to the OTel collector
-# (which writes to otel_logs in ClickHouse).
+# Enable Istio access logging mesh-wide, shipping to Alloy (which forwards
+# via otelcol to otel_logs in ClickHouse).
 # The otel-access-log provider is defined in istio-operator.yaml.
 apiVersion: telemetry.istio.io/v1alpha1
 kind: Telemetry

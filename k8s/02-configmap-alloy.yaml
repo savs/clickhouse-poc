@@ -5,7 +5,9 @@ metadata:
   namespace: travel-app
 data:
   config.alloy: |
-    // OTLP receiver — accepts metrics, logs, and traces over gRPC and HTTP
+    // ── OTLP receiver ────────────────────────────────────────────────────────
+    // Accepts metrics, logs, and traces from microservices, Grafana, and
+    // Istio sidecars (access logs via the otel-access-log extension provider).
     otelcol.receiver.otlp "default" {
       grpc {
         endpoint = "0.0.0.0:4317"
@@ -22,11 +24,84 @@ data:
       }
     }
 
-    // Scrape Alloy's own Prometheus metrics and ClickHouse's metrics
+    // ── Kubernetes pod log collection ─────────────────────────────────────────
+    // Discover all pods in the travel-app namespace and stream their
+    // stdout/stderr via the Kubernetes log API. This captures structured JSON
+    // logs from the Node.js microservices without requiring a DaemonSet or
+    // node-level filesystem access.
+    discovery.kubernetes "pods" {
+      role = "pod"
+      namespaces {
+        own_namespace = true
+      }
+    }
+
+    // Relabel Kubernetes metadata into OTel-compatible attribute names so that
+    // ServiceName, pod, namespace, and container are populated in ClickHouse.
+    // The service_name label is the key one — otelcol.receiver.loki maps it to
+    // the OTLP resource attribute service.name → ClickHouse column ServiceName.
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "service_name"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+    }
+
+    loki.source.kubernetes "pods" {
+      targets    = discovery.relabel.pods.output
+      forward_to = [otelcol.receiver.loki.k8s.receiver]
+    }
+
+    // Convert Loki-format log records to OTLP, then promote resource-level
+    // labels (service_name, namespace, pod, container) from LogAttributes to
+    // ResourceAttributes so that ServiceName is populated in ClickHouse.
+    // otelcol.receiver.loki puts all Kubernetes labels in LogAttributes by
+    // default; the transform promotes the ones that belong at the resource level.
+    otelcol.receiver.loki "k8s" {
+      output {
+        logs = [otelcol.processor.transform.k8s_resource.input]
+      }
+    }
+
+    otelcol.processor.transform "k8s_resource" {
+      error_mode = "ignore"
+
+      log_statements {
+        context = "log"
+        statements = [
+          `set(resource.attributes["service.name"],  attributes["service_name"]) where attributes["service_name"] != ""`,
+          `set(resource.attributes["k8s.namespace"], attributes["namespace"])    where attributes["namespace"]    != ""`,
+          `set(resource.attributes["k8s.pod.name"],  attributes["pod"])          where attributes["pod"]          != ""`,
+          `set(resource.attributes["k8s.container"], attributes["container"])    where attributes["container"]    != ""`,
+        ]
+      }
+
+      output {
+        logs = [otelcol.processor.batch.default.input]
+      }
+    }
+
+    // ── Prometheus scraping ───────────────────────────────────────────────────
+    // Scrape Alloy's own metrics and ClickHouse's built-in Prometheus endpoint.
+    // ClickHouse exposes metrics at port 9363 (configured via config.d XML).
     prometheus.scrape "self" {
       targets = [
         { __address__ = "localhost:12345", service = "alloy" },
-        { __address__ = "clickhouse:8123", service = "clickhouse" },
+        { __address__ = "clickhouse:9363", service = "clickhouse" },
       ]
       forward_to = [otelcol.receiver.prometheus.self.receiver]
     }
@@ -38,7 +113,7 @@ data:
       }
     }
 
-    // Batch processor — buffers data before export
+    // ── Batch processor ───────────────────────────────────────────────────────
     otelcol.processor.batch "default" {
       output {
         metrics = [otelcol.exporter.otlphttp.otelcol.input]
@@ -47,7 +122,7 @@ data:
       }
     }
 
-    // Forward everything to OTel Collector Contrib → ClickHouse
+    // ── Export to OTel Collector Contrib → ClickHouse ────────────────────────
     otelcol.exporter.otlphttp "otelcol" {
       client {
         endpoint = "http://otelcol:4318"

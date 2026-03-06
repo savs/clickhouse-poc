@@ -1,3 +1,24 @@
+# Enable ClickHouse's built-in Prometheus endpoint at port 9363.
+# Without this config, ClickHouse has no /metrics handler and Alloy's
+# prometheus.scrape for clickhouse:8123 silently fails.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-prometheus-config
+  namespace: travel-app
+data:
+  prometheus.xml: |
+    <clickhouse>
+      <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <asynchronous_metrics>true</asynchronous_metrics>
+        <status_info>true</status_info>
+        <events>true</events>
+      </prometheus>
+    </clickhouse>
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -34,6 +55,8 @@ spec:
           ports:
             - containerPort: 8123
             - containerPort: 9000
+            - containerPort: 9363
+              name: prometheus
           env:
             - name: CLICKHOUSE_DB
               value: default
@@ -46,6 +69,9 @@ spec:
               mountPath: /var/lib/clickhouse
             - name: init-sql
               mountPath: /docker-entrypoint-initdb.d
+            - name: prometheus-config
+              mountPath: /etc/clickhouse-server/config.d/prometheus.xml
+              subPath: prometheus.xml
           readinessProbe:
             exec:
               command: ["clickhouse-client", "--query", "SELECT 1"]
@@ -71,6 +97,9 @@ spec:
         - name: init-sql
           configMap:
             name: clickhouse-init
+        - name: prometheus-config
+          configMap:
+            name: clickhouse-prometheus-config
 ---
 apiVersion: v1
 kind: Service
@@ -87,3 +116,6 @@ spec:
     - name: native
       port: 9000
       targetPort: 9000
+    - name: prometheus
+      port: 9363
+      targetPort: 9363

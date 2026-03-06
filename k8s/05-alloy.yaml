@@ -27,6 +27,7 @@ spec:
       labels:
         app: alloy
     spec:
+      serviceAccountName: alloy
       containers:
         - name: alloy
           image: grafana/alloy:latest

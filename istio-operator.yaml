@@ -6,7 +6,11 @@ spec:
     # Disable default stdout access logging — all access logs go via OTel instead
     accessLogFile: ""
     extensionProviders:
+      # Route Istio access logs through Alloy so they join the same pipeline
+      # (batch processor → otelcol → ClickHouse) as all other telemetry signals.
+      # Routing directly to otelcol was unreliable because otelcol runs without
+      # an Istio sidecar, causing mTLS handshake failures from mesh-side Envoys.
       - name: otel-access-log
         opentelemetry:
           port: 4317
-          service: otelcol.travel-app.svc.cluster.local
+          service: alloy.travel-app.svc.cluster.local
